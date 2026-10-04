@@ -1,4 +1,4 @@
-// Optical FFT Bloom v2.3 -- standalone shader; no add-on required.
+// Optical FFT Bloom v2.4 -- standalone shader; no add-on required.
 // MIT License. See LICENSE.txt. Requires ReShade 6.8+, compute backend.
 // Enter actual dimensions in ReShade's effect preprocessor definitions.
 // Aperture N x N -> centred (N+1) x (N+1) kernel; one texel = one display pixel.
@@ -18,6 +18,15 @@
 #ifndef OFB2_FFT_HEIGHT
 #define OFB2_FFT_HEIGHT 0
 #endif
+#ifndef OFB2_PSF_OVERSAMPLE
+#define OFB2_PSF_OVERSAMPLE 1
+#endif
+#ifndef OFB2_LOAD_APERTURE_PNG
+#define OFB2_LOAD_APERTURE_PNG 0
+#endif
+#ifndef OFB2_APERTURE_PNG
+#define OFB2_APERTURE_PNG "OpticalFFTBloomV2_Aperture.png"
+#endif
 #if OFB2_APERTURE_SIZE < 2 || (OFB2_APERTURE_SIZE & (OFB2_APERTURE_SIZE-1))
 #error "OFB2_APERTURE_SIZE must be an even power of two: 2, 4, 8, ... 1024, 2048, ..."
 #endif
@@ -30,10 +39,21 @@
 #if OFB2_FFT_WIDTH < 0 || OFB2_FFT_HEIGHT < 0
 #error "FFT dimensions must be zero (automatic) or positive integer minimum dimensions."
 #endif
+#if OFB2_PSF_OVERSAMPLE < 1 || (OFB2_PSF_OVERSAMPLE & (OFB2_PSF_OVERSAMPLE-1))
+#error "OFB2_PSF_OVERSAMPLE must be a positive power of two: 1, 2, 4, ..."
+#endif
+#if OFB2_APERTURE_SIZE > 1073741824/OFB2_PSF_OVERSAMPLE
+#error "Optical FFT dimension cannot be represented by a signed 32-bit dimension."
+#endif
+#if OFB2_LOAD_APERTURE_PNG != 0 && OFB2_LOAD_APERTURE_PNG != 1
+#error "OFB2_LOAD_APERTURE_PNG must be 0 (procedural only) or 1 (load the optional PNG)."
+#endif
 #if __RENDERER__ < 0xb000
 #error "A compute-capable backend is required (D3D11+, Vulkan, OpenGL 4.3+)."
 #endif
 #define V2_N OFB2_APERTURE_SIZE
+#define V2_O OFB2_PSF_OVERSAMPLE
+#define V2_P (V2_N*V2_O)
 #define V2_K (V2_N+1)
 #define V2_DIV OFB2_RENDER_DIVISOR
 #define V2_W ((BUFFER_WIDTH+V2_DIV-1)/V2_DIV)
@@ -191,6 +211,10 @@ uniform int BladeCount < ui_category="Aperture"; ui_label="Blade count"; ui_cate
 uniform float BladeRotation < ui_category="Aperture"; ui_label="Blade rotation"; ui_tooltip="Rotates the lens opening in degrees. Also rotates the diffraction pattern produced by its edges."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
 uniform float BladeRoundness < ui_category="Aperture"; ui_label="Blade roundness"; ui_tooltip="Curves the whole opening outline towards a circle. 0 uses the polygon with any Blade corner rounding; 1 gives a circle. Higher values usually soften blade-related diffraction."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0.15;
 uniform float CornerRounding < ui_category="Aperture"; ui_label="Blade corner rounding"; ui_tooltip="Rounds the polygon tips while retaining straight sections of the blades. 0 keeps sharp corners. Separate from Blade roundness, which curves the whole outline; has no effect on a fully circular opening."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0;
+uniform float BladeNoiseAmount < ui_category="Aperture"; ui_label="Blade edge noise"; ui_tooltip="Irregularity of the opening edge, as a fraction of its local radius. 0 keeps the existing shape. Small values give organic pupil-like edges; larger values give a rougher diffraction pattern. Also works with Blade roundness 1."; ui_type="slider"; ui_min=0; ui_max=0.3;  > = 0;
+uniform float BladeNoiseFrequency < ui_category="Aperture"; ui_label="Blade noise detail"; ui_tooltip="Detail around the opening rim. Higher values make finer wrinkles; lower values make broad distortions. Fine detail needs enough aperture pixels. The noise wraps continuously around the opening."; ui_type="slider"; ui_min=1; ui_max=128;  > = 16;
+uniform float BladeNoiseRoughness < ui_category="Aperture"; ui_label="Blade noise roughness"; ui_tooltip="Amount of smaller wrinkles added to the main blade noise. 0 keeps the broad layer only; 1 adds the most fine detail. Requires Blade edge noise above 0."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0.5;
+uniform int BladeNoiseSeed < ui_category="Aperture"; ui_label="Blade noise seed"; ui_tooltip="Repeatable arrangement of blade-edge wrinkles. Change it for another organic shape. Separate from the dust/scratch seed and stationary between frames."; ui_type="slider"; ui_min=0; ui_max=65535;  > = 0;
 uniform float ApertureRadius < ui_category="Aperture"; ui_label="Aperture radius"; ui_tooltip="Opening radius relative to the aperture canvas. A smaller opening spreads diffraction farther and can make raw bloom dimmer."; ui_type="slider"; ui_min=0.05; ui_max=0.98;  > = 0.82;
 uniform float ApertureAspect < ui_category="Aperture"; ui_label="Aperture aspect ratio"; ui_tooltip="Width-to-height ratio of the lens opening. 1 is equal width and height; above 1 widens it and reduces its height. This changes the generated optical pattern."; ui_type="slider"; ui_min=0.25; ui_max=4;  > = 1;
 uniform float EdgeSoftness < ui_category="Aperture"; ui_label="Edge softness"; ui_tooltip="Softens the opening and support-spoke edges. Higher values reduce sharp diffraction. 0 still keeps the minimum edge smoothing needed for clean pixels."; ui_type="slider"; ui_min=0; ui_max=0.1;  > = 0.002;
@@ -200,6 +224,15 @@ uniform float StrutWidth < ui_category="Aperture"; ui_label="Strut width"; ui_to
 uniform float StrutRotation < ui_category="Aperture"; ui_label="Strut rotation"; ui_tooltip="Rotates the support spokes in degrees, independently of the aperture blades. Also changes the direction of their diffraction lines."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
 uniform float CatEye < ui_category="Aperture"; ui_label="Cat-eye clipping"; ui_tooltip="Clips one side of the opening with a shifted circular rim, giving an approximate off-axis cat-eye shape. 0 leaves it clear. The same opening is used for every light in the frame; this is not a separate lens model for screen edges."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0;
 uniform float CatEyeAngle < ui_category="Aperture"; ui_label="Cat-eye direction"; ui_tooltip="Direction of the clipped side in degrees. 0 clips the right side of the aperture preview; 90 turns the clipping by a quarter rotation. Only affects the pattern when Cat-eye clipping is above 0."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
+uniform bool UseCustomAperture < ui_category="Custom aperture"; ui_label="Use custom aperture PNG"; ui_category_closed=true; ui_tooltip="Switches to a PNG mask after OFB2_LOAD_APERTURE_PNG is set to 1 and the image is loaded. Set the quoted filename in OFB2_APERTURE_PNG and put it in a ReShade texture search folder. With loading disabled, this toggle safely retains the procedural opening.";  > = false;
+uniform bool CustomCombine < ui_category="Custom aperture"; ui_label="Keep procedural opening"; ui_tooltip="When the custom PNG is enabled, multiply it by the procedural blade shape instead of replacing that shape. Obstruction, struts, cat-eye, transmission effects and aberrations still apply in either case.";  > = false;
+uniform int CustomChannel < ui_category="Custom aperture"; ui_label="PNG mask channel"; ui_tooltip="Luminance reads a white-on-black RGB mask, Alpha reads transparency, and Red reads the red channel only. Values are sampled as numeric mask data without automatic sRGB conversion."; ui_type="combo"; ui_items="Luminance\0Alpha\0Red\0";  > = 0;
+uniform bool CustomIntensity < ui_category="Custom aperture"; ui_label="PNG represents intensity"; ui_tooltip="Enable if PNG grey values describe light intensity transmission. Their square root becomes pupil amplitude. Leave off if the values already describe amplitude; binary black/white masks are identical in either mode.";  > = false;
+uniform bool CustomInvert < ui_category="Custom aperture"; ui_label="Invert PNG mask"; ui_tooltip="Swaps clear and blocked values inside the PNG canvas. Use it for a black opening on white. Outside the transformed image remains blocked.";  > = false;
+uniform float2 CustomScale < ui_category="Custom aperture"; ui_label="PNG scale X / Y"; ui_tooltip="Separate width and height multipliers for the PNG, relative to Aperture radius and aspect. (1, 1) uses its full square canvas at the opening radius; above 1 enlarges it."; ui_type="slider"; ui_min=0.1; ui_max=4;  > = float2(1,1);
+uniform float2 CustomOffset < ui_category="Custom aperture"; ui_label="PNG offset X / Y"; ui_tooltip="Moves the PNG in fractions of the opening radius before aspect stretching. (0, 0) centres it. Moving a mask can change its phase relationship to the wavefront; an in-focus translation alone does not change its diffraction intensity."; ui_type="slider"; ui_min=-1; ui_max=1;  > = float2(0,0);
+uniform float CustomRotation < ui_category="Custom aperture"; ui_label="PNG rotation"; ui_tooltip="Rotates the PNG opening in degrees, before the common optical effects and aspect stretch."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
+uniform float CustomGamma < ui_category="Custom aperture"; ui_label="PNG mask curve"; ui_tooltip="Power curve for numeric PNG mask values. 1 leaves them unchanged; above 1 darkens grey transmission and below 1 brightens it. Not a colour-space decoder. Applied before the optional intensity-to-amplitude conversion."; ui_type="slider"; ui_min=0.1; ui_max=4;  > = 1;
 uniform float DustOpacity < ui_category="Aperture imperfections"; ui_label="Dust opacity"; ui_category_closed=true; ui_tooltip="How strongly procedural dust blocks light through the opening. 0 disables dust. Higher values make the specks darker and change the actual kernel, including its faint diffraction structure."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0;
 uniform float DustCoverage < ui_category="Aperture imperfections"; ui_label="Dust coverage"; ui_tooltip="Fraction of possible dust locations that contain a speck. Higher values add more dust at the selected size. Locations remain stable as coverage changes. Requires Dust opacity above 0."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0.35;
 uniform float DustSize < ui_category="Aperture imperfections"; ui_label="Dust size (% of opening)"; ui_tooltip="Typical dust-speck diameter as a percentage of the opening diameter before aspect stretch. 1 means about one hundredth of the diameter. Specks vary in size and shape; very small dust needs enough aperture pixels to resolve."; ui_type="slider"; ui_min=0.05; ui_max=10;  > = 1.5;
@@ -222,6 +255,13 @@ uniform float Coma < ui_category="Focus and aberrations"; ui_label="Coma"; ui_to
 uniform float ComaAngle < ui_category="Focus and aberrations"; ui_label="Coma angle"; ui_tooltip="Direction of the comet-like distortion, in degrees. Only affects the pattern when Coma is nonzero."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
 uniform float Trefoil < ui_category="Focus and aberrations"; ui_label="Trefoil"; ui_tooltip="Adds a three-lobed distortion to the light-spread pattern. 0 removes it; a larger absolute value strengthens the shape."; ui_type="slider"; ui_min=-4; ui_max=4;  > = 0;
 uniform float TrefoilAngle < ui_category="Focus and aberrations"; ui_label="Trefoil angle"; ui_tooltip="Rotates the three-lobed distortion in degrees. Only affects the pattern when Trefoil is nonzero."; ui_type="slider"; ui_min=-180; ui_max=180;  > = 0;
+uniform bool FresnelEnabled < ui_category="Fresnel propagation"; ui_label="Fresnel propagation"; ui_category_closed=true; ui_tooltip="Propagates the complex pupil using the scalar paraxial Fresnel integral, with physical dimensions and wavelength-dependent output sampling. Off keeps the existing focused FFT model. Increase aperture resolution if the pupil phase is too finely spaced, and use OFB2_PSF_OVERSAMPLE for finer output ring sampling.";  > = false;
+uniform bool FresnelLens < ui_category="Fresnel propagation"; ui_label="Include focusing lens"; ui_tooltip="Adds an ideal thin lens before Fresnel propagation. When distance equals focal length, its curvature cancels the propagation curvature and produces focused diffraction. Disable for a plane wave passing through an aperture into free space.";  > = true;
+uniform float FresnelCanvasMM < ui_category="Fresnel propagation"; ui_label="Pupil canvas width (mm)"; ui_tooltip="Physical side of the square pupil canvas in millimetres. The reference opening diameter is this width times Aperture radius, before aspect distortion or clipping. Larger pupils generally require more phase samples away from focus."; ui_type="slider"; ui_min=0.05; ui_max=20;  > = 1;
+uniform float FresnelDistanceMM < ui_category="Fresnel propagation"; ui_label="Propagation distance (mm)"; ui_tooltip="Distance from the pupil to the observation plane, in millimetres. Changes Fresnel curvature and the physical size of its rings. Positive distances only; with a lens, equality to focal length is best focus."; ui_type="slider"; ui_min=1; ui_max=5000;  > = 50;
+uniform float FresnelFocalMM < ui_category="Fresnel propagation"; ui_label="Lens focal length (mm)"; ui_tooltip="Focal length of the ideal thin lens, in millimetres. Used only when Include focusing lens is on. Distance and focal length control physical focus; the existing signed Defocus remains an additional wavefront error."; ui_type="slider"; ui_min=1; ui_max=1000;  > = 50;
+uniform float FresnelPixelUM < ui_category="Fresnel propagation"; ui_label="Observation pixel pitch (um)"; ui_tooltip="Physical width represented by one display/kernel pixel in the observation plane, in micrometres. Smaller values show a larger optical pattern on screen. Does not change the allocated kernel or scene-processing resolution."; ui_type="slider"; ui_min=0.1; ui_max=50;  > = 2;
+uniform bool FresnelUnshaped < ui_category="Fresnel propagation"; ui_label="Unshaped Fresnel PSF"; ui_tooltip="Uses propagated intensity with its physical scale and spectral spread. Ignores PSF scale, post-kernel stretch/rotation, core/wing shaping, spike boosts, wing lift, fringe suppression and wide edge fade. Normalization and PSF exposure still apply. Off allows those appearance controls over the Fresnel result.";  > = true;
 uniform float KernelScale < ui_category="Kernel and anamorphism"; ui_label="PSF scale (display pixels)"; ui_category_closed=true; ui_tooltip="1 uses native optical sampling: one aperture-FFT sample per display pixel before spectral scaling or anamorphism. Higher values enlarge and interpolate the pattern; lower values shrink it. Independent of the render divisor."; ui_type="slider"; ui_min=0.25; ui_max=32;  > = 1;
 uniform float Anamorphism < ui_category="Kernel and anamorphism"; ui_label="Anamorphic stretch"; ui_tooltip="1 gives no extra stretch. Above 1 stretches the glow horizontally and squeezes it vertically; below 1 reverses this. Applied to the kernel independently of Aperture aspect ratio."; ui_type="slider"; ui_min=0.125; ui_max=8;  > = 1;
 uniform float2 KernelStretch < ui_category="Kernel and anamorphism"; ui_label="Kernel stretch X / Y"; ui_tooltip="Separate horizontal (X) and vertical (Y) size multipliers for the glow. (1, 1) gives no extra stretch; 2 doubles that axis."; ui_type="slider"; ui_min=0.125; ui_max=8;  > = float2(1,1);
@@ -248,7 +288,7 @@ uniform int FrameCount < source="framecount"; >;
 uniform float FrameTime < source="frametime"; >;
 uniform bool ForceRebuild < source="key"; keycode=0x75; mode="press"; >;
 
-texture2D ParamHistory { Width=14; Height=1; Format=RGBA32F; };
+texture2D ParamHistory { Width=20; Height=1; Format=RGBA32F; };
 sampler2D ParamHistoryS { Texture=ParamHistory; MinFilter=POINT; MagFilter=POINT; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; };
 storage2D ParamHistoryU { Texture=ParamHistory; };
 texture2D CacheStatus { Width=1; Height=1; Format=RGBA32F; };
@@ -266,18 +306,22 @@ storage2D SourceStatsU { Texture=SourceStats; };
 texture2D Aperture { Width=V2_N; Height=V2_N; Format=RGBA32F; };
 sampler2D ApertureS { Texture=Aperture; MinFilter=LINEAR; MagFilter=LINEAR; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; };
 storage2D ApertureU { Texture=Aperture; };
-texture3D PupilA { Width=V2_N; Height=V2_N; Depth=V2_WAVES; Format=RG32F; };
+texture3D PupilA { Width=V2_P; Height=V2_P; Depth=V2_WAVES; Format=RG32F; };
 sampler3D PupilAS { Texture=PupilA; MinFilter=POINT; MagFilter=POINT; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; AddressW=CLAMP; };
 storage3D PupilAU { Texture=PupilA; };
-texture3D PupilB { Width=V2_N; Height=V2_N; Depth=V2_WAVES; Format=RG32F; };
+texture3D PupilB { Width=V2_P; Height=V2_P; Depth=V2_WAVES; Format=RG32F; };
 sampler3D PupilBS { Texture=PupilB; MinFilter=POINT; MagFilter=POINT; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; AddressW=CLAMP; };
 storage3D PupilBU { Texture=PupilB; };
-texture3D PupilRows { Width=V2_N; Height=V2_N; Depth=V2_WAVES; Format=RG32F; };
+texture3D PupilRows { Width=V2_P; Height=V2_P; Depth=V2_WAVES; Format=RG32F; };
 sampler3D PupilRowsS { Texture=PupilRows; MinFilter=POINT; MagFilter=POINT; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; AddressW=CLAMP; };
 storage3D PupilRowsU { Texture=PupilRows; };
-texture3D OpticalPSF { Width=V2_N; Height=V2_N; Depth=V2_WAVES; Format=R32F; };
+texture3D OpticalPSF { Width=V2_P; Height=V2_P; Depth=V2_WAVES; Format=R32F; };
 sampler3D OpticalPSFS { Texture=OpticalPSF; MinFilter=LINEAR; MagFilter=LINEAR; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; AddressW=CLAMP; };
 storage3D OpticalPSFU { Texture=OpticalPSF; };
+#if OFB2_LOAD_APERTURE_PNG
+texture2D CustomAperture < source=OFB2_APERTURE_PNG; > { Width=V2_N; Height=V2_N; Format=RGBA8; };
+sampler2D CustomApertureS { Texture=CustomAperture; MinFilter=LINEAR; MagFilter=LINEAR; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; SRGBTexture=false; };
+#endif
 texture2D RawKernel { Width=V2_K; Height=V2_K; Format=RGBA32F; };
 sampler2D RawKernelS { Texture=RawKernel; MinFilter=LINEAR; MagFilter=LINEAR; MipFilter=POINT; AddressU=CLAMP; AddressV=CLAMP; };
 storage2D RawKernelU { Texture=RawKernel; };
@@ -349,30 +393,36 @@ bool Empty(){return tex2Dfetch(SourceStatsS,int2(0,0)).y<=0.00000001;}
 
 float4 OpticalParameters(int i){float4 v=0;switch(i){
 case 0:v=float4(BladeCount,BladeRotation,BladeRoundness,CornerRounding);break;
-case 1:v=float4(ApertureRadius,ApertureAspect,EdgeSoftness,Obstruction);break;
-case 2:v=float4(StrutCount,StrutWidth,StrutRotation,CatEye);break;
-case 3:v=float4(CatEyeAngle,DustOpacity,DustCoverage,DustSize);break;
-case 4:v=float4(ScratchOpacity,ScratchCount,ScratchWidth,ScratchLength);break;
-case 5:v=float4(ScratchAngle,ScratchSpread,TransmissionVariation,TransmissionSize);break;
-case 6:v=float4(Apodization,ApodizationFalloff,ImperfectionSeed,Defocus);break;
-case 7:v=float4(Astigmatism,AstigmatismAngle,Spherical,Coma);break;
-case 8:v=float4(ComaAngle,Trefoil,TrefoilAngle,KernelScale);break;
-case 9:v=float4(Anamorphism,KernelStretch.x,KernelStretch.y,KernelRotation);break;
-case 10:v=float4(Normalization,KernelExposure,KernelEdgeFade,DiffractionStrength);break;
-case 11:v=float4(DiffractionExposure,CoreIntensity,WingIntensity,WingLift);break;
-case 12:v=float4(SpectralDispersion,ChromaticFocus,FringeSuppression,V2_N);break;
-case 13:v=float4(V2_DIV,V2_FX,V2_FY,V2_WAVES);break;
+case 1:v=float4(BladeNoiseAmount,BladeNoiseFrequency,BladeNoiseRoughness,BladeNoiseSeed);break;
+case 2:v=float4(ApertureRadius,ApertureAspect,EdgeSoftness,Obstruction);break;
+case 3:v=float4(StrutCount,StrutWidth,StrutRotation,CatEye);break;
+case 4:v=float4(CatEyeAngle,UseCustomAperture,CustomCombine,CustomChannel);break;
+case 5:v=float4(CustomIntensity,CustomInvert,CustomScale.x,CustomScale.y);break;
+case 6:v=float4(CustomOffset.x,CustomOffset.y,CustomRotation,CustomGamma);break;
+case 7:v=float4(DustOpacity,DustCoverage,DustSize,ScratchOpacity);break;
+case 8:v=float4(ScratchCount,ScratchWidth,ScratchLength,ScratchAngle);break;
+case 9:v=float4(ScratchSpread,TransmissionVariation,TransmissionSize,Apodization);break;
+case 10:v=float4(ApodizationFalloff,ImperfectionSeed,Defocus,Astigmatism);break;
+case 11:v=float4(AstigmatismAngle,Spherical,Coma,ComaAngle);break;
+case 12:v=float4(Trefoil,TrefoilAngle,FresnelEnabled,FresnelLens);break;
+case 13:v=float4(FresnelCanvasMM,FresnelDistanceMM,FresnelFocalMM,FresnelPixelUM);break;
+case 14:v=float4(FresnelUnshaped,KernelScale,Anamorphism,KernelStretch.x);break;
+case 15:v=float4(KernelStretch.y,KernelRotation,Normalization,KernelExposure);break;
+case 16:v=float4(KernelEdgeFade,DiffractionStrength,DiffractionExposure,CoreIntensity);break;
+case 17:v=float4(WingIntensity,WingLift,SpectralDispersion,ChromaticFocus);break;
+case 18:v=float4(FringeSuppression,V2_N,V2_DIV,V2_FX);break;
+case 19:v=float4(V2_FY,V2_WAVES,V2_P,OFB2_LOAD_APERTURE_PNG);break;
 }return v;}
 [numthreads(1,1,1)]void CS_CacheState(uint3 id:SV_DispatchThreadID){
  float4 old=tex2Dfetch(CacheHistoryS,int2(0,0));
- bool valid=old.w==2023 && old.x==float(FrameCount-1);
+ bool valid=old.w==2024 && old.x==float(FrameCount-1);
  bool dirty=!valid||ForceRebuild;
- for(int i=0;i<14;++i)dirty=dirty||any(OpticalParameters(i)!=tex2Dfetch(ParamHistoryS,int2(i,0)));
+ for(int i=0;i<20;++i)dirty=dirty||any(OpticalParameters(i)!=tex2Dfetch(ParamHistoryS,int2(i,0)));
  tex2Dstore(CacheStatusU,int2(0,0),float4(dirty?1:0,valid?1:0,0,old.z+(dirty?1:0)));
- tex2Dstore(CacheNextU,int2(0,0),float4(FrameCount,0,old.z+(dirty?1:0),2023));
+ tex2Dstore(CacheNextU,int2(0,0),float4(FrameCount,0,old.z+(dirty?1:0),2024));
 }
 [numthreads(1,1,1)]void CS_CacheCommit(uint3 id:SV_DispatchThreadID){
- if(Dirty())for(int i=0;i<14;++i)tex2Dstore(ParamHistoryU,int2(i,0),OpticalParameters(i));
+ if(Dirty())for(int i=0;i<20;++i)tex2Dstore(ParamHistoryU,int2(i,0),OpticalParameters(i));
  tex2Dstore(CacheHistoryU,int2(0,0),tex2Dfetch(CacheNextS,int2(0,0)));
 }
 // Transmission and low-order Zernike wavefront on a procedurally drawn pupil.
@@ -381,9 +431,10 @@ uint PupilHash(uint h){
  h^=h>>16;h*=2246822519u;h^=h>>13;h*=3266489917u;h^=h>>16;
  return h;
 }
-uint PupilCellHash(int2 cell,uint salt){
- return PupilHash(uint(cell.x)*1597334677u^uint(cell.y)*3812015801u^uint(ImperfectionSeed)*747796405u^salt);
+uint PupilCellHashSeed(int2 cell,uint seed,uint salt){
+ return PupilHash(uint(cell.x)*1597334677u^uint(cell.y)*3812015801u^seed*747796405u^salt);
 }
+uint PupilCellHash(int2 cell,uint salt){return PupilCellHashSeed(cell,uint(ImperfectionSeed),salt);}
 float PupilRandom(uint h){return float(PupilHash(h)&16777215u)/16777216.0;}
 float PupilNoise(float2 p){
  int2 cell=int2(floor(p));float2 f=frac(p);f=f*f*(3-2*f);
@@ -392,6 +443,43 @@ float PupilNoise(float2 p){
  float c=PupilRandom(PupilCellHash(cell+int2(0,1),1831565813u));
  float d=PupilRandom(PupilCellHash(cell+int2(1,1),1831565813u));
  return lerp(lerp(a,b,f.x),lerp(c,d,f.x),f.y);
+}
+float BladeValueNoise(float2 p){
+ int2 cell=int2(floor(p));float2 f=frac(p);f=f*f*(3-2*f);
+ float a=PupilRandom(PupilCellHashSeed(cell,uint(BladeNoiseSeed),1367130551u));
+ float b=PupilRandom(PupilCellHashSeed(cell+int2(1,0),uint(BladeNoiseSeed),1367130551u));
+ float c=PupilRandom(PupilCellHashSeed(cell+int2(0,1),uint(BladeNoiseSeed),1367130551u));
+ float d=PupilRandom(PupilCellHashSeed(cell+int2(1,1),uint(BladeNoiseSeed),1367130551u));
+ return lerp(lerp(a,b,f.x),lerp(c,d,f.x),f.y);
+}
+float BladeEdgeNoise(float angle){
+ // Sampling a circle makes the angular noise periodic with no seam at +/- PI.
+ float2 p=float2(cos(angle),sin(angle))*max(BladeNoiseFrequency,0.0001);
+ float rough=saturate(BladeNoiseRoughness),w=rough*0.5;
+ float n=BladeValueNoise(p)+w*BladeValueNoise(p*2+float2(17.13,4.79));
+ n+=w*w*BladeValueNoise(p*4+float2(8.67,29.41));
+ return (n/(1+w+w*w))*2-1;
+}
+bool CustomOpeningActive(){
+ #if OFB2_LOAD_APERTURE_PNG
+ return UseCustomAperture;
+ #else
+ return false;
+ #endif
+}
+float CustomOpening(float2 q){
+ float mask=0;
+ #if OFB2_LOAD_APERTURE_PNG
+ float2 uv=Rotate(q-CustomOffset,-radians(CustomRotation))/max(CustomScale,0.0001)*0.5+0.5;
+ if(all(uv>=0)&&all(uv<=1)){
+  float4 image=tex2Dlod(CustomApertureS,float4(uv,0,0));
+  mask=CustomChannel==1?image.a:CustomChannel==2?image.r:Lum(image.rgb);
+  mask=saturate(mask);if(CustomInvert)mask=1-mask;
+  if(mask>0 && CustomGamma!=1)mask=pow(mask,max(CustomGamma,0.0001));
+  if(CustomIntensity)mask=sqrt(max(mask,0));
+ }
+ #endif
+ return saturate(mask);
 }
 float ImperfectTransmission(float2 q){
  float transmission=1;
@@ -449,15 +537,21 @@ float4 PupilModel(float2 p){
   }
  }
  bound=lerp(bound,1,saturate(BladeRoundness));
+ if(BladeNoiseAmount>0)bound*=max(1+max(BladeNoiseAmount,0)*BladeEdgeNoise(angle),0.01);
  float edge=max(EdgeSoftness,0.5/V2_N);
  float transmission=1-smoothstep(bound-edge,bound+edge,r);
+ float2 q=p/max(ApertureRadius,0.0001);
+ if(CustomOpeningActive()){
+  float custom=CustomOpening(q);
+  transmission=CustomCombine?transmission*custom:custom;
+  if(!CustomCombine)bound=1;
+ }
  if(Obstruction>0)transmission*=smoothstep(Obstruction-edge,Obstruction+edge,r);
  for(int s=0;s<StrutCount;++s){
   float2 v=Rotate(p,-radians(StrutRotation)-2*PI*s/max(StrutCount,1));
   float cut=(1-smoothstep(StrutWidth-edge,StrutWidth+edge,abs(v.y)/max(ApertureRadius,0.0001)))*smoothstep(-edge,edge,v.x);
   transmission*=1-cut;
  }
- float2 q=p/max(ApertureRadius,0.0001);
  if(CatEye>0){
   float direction=radians(CatEyeAngle);
   float2 clipped=q+float2(cos(direction),sin(direction))*saturate(CatEye)*1.2;
@@ -498,11 +592,24 @@ float Lambda(uint slice){
  return lambda;
 }
 float2 PupilAt(int2 p,uint slice){
- float4 aperture=tex2Dfetch(ApertureS,p);
+ int2 source=p-(V2_P-V2_N)/2;
+ float2 value=0;
+ if(all(source>=0)&&all(source<V2_N)){
+ float4 aperture=tex2Dfetch(ApertureS,source);
  float wavelength=Lambda(slice),shift=(wavelength-550)/550;
  float wave=aperture.y*550/wavelength+ChromaticFocus*shift*(2*aperture.z-1);
+ if(FresnelEnabled){
+  float2 physical=(float2(source)+0.5)/V2_N-0.5;
+  physical*=max(FresnelCanvasMM,0.000001);
+  float curvature=1/max(FresnelDistanceMM,0.000001);
+  if(FresnelLens)curvature-=1/max(FresnelFocalMM,0.000001);
+  // The output-plane chirp/global phase are omitted: they vanish in |U|^2.
+  wave+=0.5*dot(physical,physical)*curvature/(wavelength*0.000001);
+ }
  float phase=frac(wave)*2*PI;
- return aperture.x*float2(cos(phase),sin(phase));
+ value=aperture.x*float2(cos(phase),sin(phase));
+ }
+ return value;
 }
 
 float2 PupilARead(int2 p,uint c){return tex3Dfetch(PupilAS,int3(p,c)).xy;}
@@ -521,8 +628,8 @@ float2 TransferRead(int2 p,uint c){float2 v=0;if(c==0)v=tex2Dfetch(TransferRS,p)
 void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float4(v,0,0));else if(c==1)tex2Dstore(TransferGU,p,float4(v,0,0));else tex2Dstore(TransferBU,p,float4(v,0,0));}
 [numthreads(256,1,1)]void CS_PupilXLocal(uint3 gid:SV_GroupID,uint3 tid:SV_GroupThreadID){
  if(!(Dirty())||gid.z>=V2_WAVES)return;
- const uint N=V2_N,B=min(N,1024u);uint line=gid.y,base=gid.x*B;
- for(uint t=tid.x;t<B;t+=256){uint j=BitReverse(base+t,N);FFTShared[t]=PupilAt(int2(j,line),gid.z)/float(V2_N);}
+ const uint N=V2_P,B=min(N,1024u);uint line=gid.y,base=gid.x*B;
+ for(uint t=tid.x;t<B;t+=256){uint j=BitReverse(base+t,N);FFTShared[t]=PupilAt(int2(j,line),gid.z)/float(V2_P);}
  barrier();
  for(uint span=2;span<=B;span<<=1){
   for(uint b=tid.x;b<B/2;b+=256){uint k=b%(span/2),i=(b/(span/2))*span+k;
@@ -533,9 +640,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
  for(uint t=tid.x;t<B;t+=256){uint k=base+t;PupilAWrite(int2(k,line),gid.z,FFTShared[t]);}
 }
 #define Pupil_X_OUT PupilARead
-#if V2_N >= 2048
+#if V2_P >= 2048
 [numthreads(256,1,1)]void CS_PupilX2048(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=2048;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -544,9 +651,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 4096
+#if V2_P >= 4096
 [numthreads(256,1,1)]void CS_PupilX4096(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=4096;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -555,9 +662,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 8192
+#if V2_P >= 8192
 [numthreads(256,1,1)]void CS_PupilX8192(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=8192;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -566,9 +673,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 16384
+#if V2_P >= 16384
 [numthreads(256,1,1)]void CS_PupilX16384(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=16384;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -577,9 +684,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 32768
+#if V2_P >= 32768
 [numthreads(256,1,1)]void CS_PupilX32768(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=32768;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -588,9 +695,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 65536
+#if V2_P >= 65536
 [numthreads(256,1,1)]void CS_PupilX65536(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=65536;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -599,9 +706,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 131072
+#if V2_P >= 131072
 [numthreads(256,1,1)]void CS_PupilX131072(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=131072;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -610,9 +717,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 262144
+#if V2_P >= 262144
 [numthreads(256,1,1)]void CS_PupilX262144(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=262144;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -621,9 +728,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 524288
+#if V2_P >= 524288
 [numthreads(256,1,1)]void CS_PupilX524288(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=524288;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -632,9 +739,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 1048576
+#if V2_P >= 1048576
 [numthreads(256,1,1)]void CS_PupilX1048576(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=1048576;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -643,9 +750,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 2097152
+#if V2_P >= 2097152
 [numthreads(256,1,1)]void CS_PupilX2097152(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=2097152;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -654,9 +761,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 4194304
+#if V2_P >= 4194304
 [numthreads(256,1,1)]void CS_PupilX4194304(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=4194304;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -665,9 +772,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 8388608
+#if V2_P >= 8388608
 [numthreads(256,1,1)]void CS_PupilX8388608(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=8388608;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -676,9 +783,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 16777216
+#if V2_P >= 16777216
 [numthreads(256,1,1)]void CS_PupilX16777216(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=16777216;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -687,9 +794,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 33554432
+#if V2_P >= 33554432
 [numthreads(256,1,1)]void CS_PupilX33554432(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=33554432;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -698,9 +805,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 67108864
+#if V2_P >= 67108864
 [numthreads(256,1,1)]void CS_PupilX67108864(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=67108864;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -709,9 +816,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 134217728
+#if V2_P >= 134217728
 [numthreads(256,1,1)]void CS_PupilX134217728(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=134217728;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -720,9 +827,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 268435456
+#if V2_P >= 268435456
 [numthreads(256,1,1)]void CS_PupilX268435456(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=268435456;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -731,9 +838,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilARead
 #endif
-#if V2_N >= 536870912
+#if V2_P >= 536870912
 [numthreads(256,1,1)]void CS_PupilX536870912(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=536870912;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(i,line),id.z),y=Cmul(PupilARead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -742,9 +849,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_X_OUT
 #define Pupil_X_OUT PupilBRead
 #endif
-#if V2_N >= 1073741824
+#if V2_P >= 1073741824
 [numthreads(256,1,1)]void CS_PupilX1073741824(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=1073741824;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(i,line),id.z),y=Cmul(PupilBRead(int2(i+span/2,line),id.z),float2(cos(angle),sin(angle)));
@@ -754,13 +861,13 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #define Pupil_X_OUT PupilARead
 #endif
 [numthreads(16,16,1)]void CS_PupilRowsCommit(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P||id.y>=V2_P)return;
  PupilRowsWrite(int2(id.xy),id.z,Pupil_X_OUT(int2(id.xy),id.z));
 }
 [numthreads(256,1,1)]void CS_PupilYLocal(uint3 gid:SV_GroupID,uint3 tid:SV_GroupThreadID){
  if(!(Dirty())||gid.z>=V2_WAVES)return;
- const uint N=V2_N,B=min(N,1024u);uint line=gid.y,base=gid.x*B;
- for(uint t=tid.x;t<B;t+=256){uint j=BitReverse(base+t,N);FFTShared[t]=PupilRowsRead(int2(line,j),gid.z)/float(V2_N);}
+ const uint N=V2_P,B=min(N,1024u);uint line=gid.y,base=gid.x*B;
+ for(uint t=tid.x;t<B;t+=256){uint j=BitReverse(base+t,N);FFTShared[t]=PupilRowsRead(int2(line,j),gid.z)/float(V2_P);}
  barrier();
  for(uint span=2;span<=B;span<<=1){
   for(uint b=tid.x;b<B/2;b+=256){uint k=b%(span/2),i=(b/(span/2))*span+k;
@@ -771,9 +878,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
  for(uint t=tid.x;t<B;t+=256){uint k=base+t;PupilAWrite(int2(line,k),gid.z,FFTShared[t]);}
 }
 #define Pupil_Y_OUT PupilARead
-#if V2_N >= 2048
+#if V2_P >= 2048
 [numthreads(256,1,1)]void CS_PupilY2048(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=2048;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -782,9 +889,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 4096
+#if V2_P >= 4096
 [numthreads(256,1,1)]void CS_PupilY4096(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=4096;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -793,9 +900,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 8192
+#if V2_P >= 8192
 [numthreads(256,1,1)]void CS_PupilY8192(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=8192;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -804,9 +911,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 16384
+#if V2_P >= 16384
 [numthreads(256,1,1)]void CS_PupilY16384(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=16384;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -815,9 +922,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 32768
+#if V2_P >= 32768
 [numthreads(256,1,1)]void CS_PupilY32768(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=32768;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -826,9 +933,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 65536
+#if V2_P >= 65536
 [numthreads(256,1,1)]void CS_PupilY65536(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=65536;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -837,9 +944,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 131072
+#if V2_P >= 131072
 [numthreads(256,1,1)]void CS_PupilY131072(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=131072;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -848,9 +955,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 262144
+#if V2_P >= 262144
 [numthreads(256,1,1)]void CS_PupilY262144(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=262144;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -859,9 +966,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 524288
+#if V2_P >= 524288
 [numthreads(256,1,1)]void CS_PupilY524288(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=524288;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -870,9 +977,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 1048576
+#if V2_P >= 1048576
 [numthreads(256,1,1)]void CS_PupilY1048576(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=1048576;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -881,9 +988,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 2097152
+#if V2_P >= 2097152
 [numthreads(256,1,1)]void CS_PupilY2097152(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=2097152;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -892,9 +999,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 4194304
+#if V2_P >= 4194304
 [numthreads(256,1,1)]void CS_PupilY4194304(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=4194304;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -903,9 +1010,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 8388608
+#if V2_P >= 8388608
 [numthreads(256,1,1)]void CS_PupilY8388608(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=8388608;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -914,9 +1021,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 16777216
+#if V2_P >= 16777216
 [numthreads(256,1,1)]void CS_PupilY16777216(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=16777216;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -925,9 +1032,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 33554432
+#if V2_P >= 33554432
 [numthreads(256,1,1)]void CS_PupilY33554432(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=33554432;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -936,9 +1043,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 67108864
+#if V2_P >= 67108864
 [numthreads(256,1,1)]void CS_PupilY67108864(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=67108864;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -947,9 +1054,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 134217728
+#if V2_P >= 134217728
 [numthreads(256,1,1)]void CS_PupilY134217728(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=134217728;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -958,9 +1065,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 268435456
+#if V2_P >= 268435456
 [numthreads(256,1,1)]void CS_PupilY268435456(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=268435456;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -969,9 +1076,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilARead
 #endif
-#if V2_N >= 536870912
+#if V2_P >= 536870912
 [numthreads(256,1,1)]void CS_PupilY536870912(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=536870912;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilARead(int2(line,i),id.z),y=Cmul(PupilARead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -980,9 +1087,9 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #undef Pupil_Y_OUT
 #define Pupil_Y_OUT PupilBRead
 #endif
-#if V2_N >= 1073741824
+#if V2_P >= 1073741824
 [numthreads(256,1,1)]void CS_PupilY1073741824(uint3 id:SV_DispatchThreadID){
- if(!(Dirty())||id.x>=V2_N/2||id.y>=V2_N)return;
+ if(!(Dirty())||id.x>=V2_P/2||id.y>=V2_P)return;
  const uint span=1073741824;uint k=id.x%(span/2),i=(id.x/(span/2))*span+k,line=id.y;
  float angle=-1*2*PI*float(k)/float(span);
  float2 x=PupilBRead(int2(line,i),id.z),y=Cmul(PupilBRead(int2(line,i+span/2),id.z),float2(cos(angle),sin(angle)));
@@ -992,31 +1099,49 @@ void TransferWrite(int2 p,uint c,float2 v){if(c==0)tex2Dstore(TransferRU,p,float
 #define Pupil_Y_OUT PupilARead
 #endif
 [numthreads(8,8,1)]void CS_OpticalIntensity(uint3 id:SV_DispatchThreadID){
- if(!Dirty()||id.x>=V2_N||id.y>=V2_N||id.z>=V2_WAVES)return;
- int2 p=(int2(id.xy)+V2_N/2)%V2_N;
+ if(!Dirty()||id.x>=V2_P||id.y>=V2_P||id.z>=V2_WAVES)return;
+ int2 p=(int2(id.xy)+V2_P/2)%V2_P;
  float2 a=Pupil_Y_OUT(p,id.z);
  // The forward FFT uses 1/N per axis. No measured energy/peak normalization.
- tex3Dstore(OpticalPSFU,int3(id),dot(a,a).xxxx);
+ // Refer energy to the original N-square pupil canvas, not its zero padding.
+ float intensity=dot(a,a)*float(V2_O)*float(V2_O);
+ tex3Dstore(OpticalPSFU,int3(id),intensity.xxxx);
 }
 float SlicePSF(float2 q,uint s){
- float2 p=q+V2_N*0.5;
+ float2 p=q+V2_P*0.5;
  float value=0;
- if(all(abs(q)<=V2_N*0.5)){
+ if(all(abs(q)<=V2_P*0.5)){
   // Wrap the Nyquist endpoint to obtain an odd, inclusive centred canvas.
   int2 b=int2(floor(p));float2 f=frac(p);
-  int2 a=b%V2_N,c=(b+1)%V2_N;
+  if(FresnelEnabled){
+   // Derive address and fraction from the SAME unshifted coordinate. FXC can
+   // fold frac(q+integer) into frac(q); rounding after the large centre offset
+   // would then select a different bin near negative integer boundaries.
+   int2 origin=int2(floor(q));b=origin+V2_P/2;f=q-float2(origin);
+  }
+  int2 a=b%V2_P,c=(b+1)%V2_P;
   float l=lerp(tex3Dfetch(OpticalPSFS,int3(a,s)).r,tex3Dfetch(OpticalPSFS,int3(c.x,a.y,s)).r,f.x);
   float h=lerp(tex3Dfetch(OpticalPSFS,int3(a.x,c.y,s)).r,tex3Dfetch(OpticalPSFS,int3(c,s)).r,f.x);
   value=lerp(l,h,f.y);
  }
  return max(value,0);
 }
+float SampleStretch(uint s){
+ float wavelength=Lambda(s),stretch=1;
+ if(FresnelEnabled){
+  // Single-FFT Fresnel output pitch is lambda*z/(oversample*canvas_width).
+  stretch=wavelength*0.000001*max(FresnelDistanceMM,0.000001);
+  stretch/=max(FresnelCanvasMM,0.000001)*max(FresnelPixelUM*0.001,0.000000001);
+  if(!FresnelUnshaped)stretch*=pow(max(wavelength/550,0.0001),SpectralDispersion-1);
+ }else stretch=pow(max(wavelength/550,0.0001),max(SpectralDispersion,0));
+ return max(stretch/float(V2_O),0.00000001);
+}
 float3 SpectralPSF(float2 q){
  float3 value=0;
  #if V2_WAVES == 3
  for(uint s=0;s<3;++s){
-  float stretch=pow(max(Lambda(s)/550,0.0001),max(SpectralDispersion,0));
-  value[s]=SlicePSF(q/max(stretch,0.0001),s)/(stretch*stretch);
+  float stretch=SampleStretch(s);
+  value[s]=SlicePSF(q/stretch,s)/(stretch*stretch);
  }
  #else
  float3 weights=0;
@@ -1024,15 +1149,22 @@ float3 SpectralPSF(float2 q){
   float wavelength=Lambda(s);
   float3 deviation=(wavelength-float3(610,545,455))/float3(48,36,30);
   float3 response=exp(-0.5*deviation*deviation);
-  float stretch=pow(max(wavelength/550,0.0001),max(SpectralDispersion,0));
-  value+=response*SlicePSF(q/max(stretch,0.0001),s)/(stretch*stretch);
+  float stretch=SampleStretch(s);
+  value+=response*SlicePSF(q/stretch,s)/(stretch*stretch);
   weights+=response;
  }
  value/=max(weights,0.00000001);
  #endif
- return lerp(value,Lum(value).xxx,saturate(FringeSuppression));
+ float suppression=(FresnelEnabled && FresnelUnshaped)?0:saturate(FringeSuppression);
+ return lerp(value,Lum(value).xxx,suppression);
 }
 float3 ShapeKernel(float2 display){
+ float3 value=0;
+ if(FresnelEnabled && FresnelUnshaped){
+  // Keep the directly propagated intensity; only taper the finite canvas rim.
+  float edge=max(abs(display.x),abs(display.y));
+  value=SpectralPSF(display)*(1-smoothstep(max(V2_N*0.5-2,0),V2_N*0.5,edge));
+ }else{
  float2 p=Rotate(display,-radians(KernelRotation));
  p/=max(KernelStretch,0.0001)*float2(max(Anamorphism,0.0001),1/max(Anamorphism,0.0001));
  float2 q=p/max(KernelScale,0.0001);
@@ -1041,13 +1173,14 @@ float3 ShapeKernel(float2 display){
  float3 directional=max(base-angular,0);
  float distance2=dot(q,q);
  float core=exp(-0.5*distance2);
- float3 value=base*lerp(WingIntensity,CoreIntensity,core);
+ value=base*lerp(WingIntensity,CoreIntensity,core);
  value+=directional*DiffractionStrength*exp2(DiffractionExposure)*(1-core);
  value=pow(max(value,0),max(1-WingLift,0.05));
  // Square edge fade. Keep the two-pixel base taper for clean pixel integration.
  float edge=max(abs(display.x),abs(display.y));
  float fadeWidth=max(2,V2_N*0.5*saturate(KernelEdgeFade));
  value*=1-smoothstep(max(V2_N*0.5-fadeWidth,0),V2_N*0.5,edge);
+ }
  return value;
 }
 [numthreads(8,8,1)]void CS_RawKernel(uint3 id:SV_DispatchThreadID){
@@ -2652,133 +2785,133 @@ float4 PS_Composite(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target{
  return float4(Encode(result),1);
 }
 
-technique OpticalFFTBloomV2 < ui_label="Optical FFT Bloom v2.3"; ui_tooltip="Standalone procedural optics. Resolution: OFB2_APERTURE_SIZE and OFB2_RENDER_DIVISOR in effect preprocessor definitions; no shader-imposed resolution ceiling."; > {
+technique OpticalFFTBloomV2 < ui_label="Optical FFT Bloom v2.4"; ui_tooltip="Procedural or custom-PNG optics, optional calibrated Fresnel propagation. Edit resolution, PSF oversampling and PNG loading in effect preprocessor definitions; no shader-imposed resolution ceiling."; > {
  pass CacheState { ComputeShader=CS_CacheState; DispatchSizeX=1; DispatchSizeY=1; DispatchSizeZ=1; GenerateMipMaps=false; }
  pass Aperture { ComputeShader=CS_Aperture; DispatchSizeX=(V2_N+7)/8; DispatchSizeY=(V2_N+7)/8; DispatchSizeZ=1; GenerateMipMaps=false; }
- pass PupilXLocal { ComputeShader=CS_PupilXLocal; DispatchSizeX=(V2_N+1023)/1024; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
-#if V2_N >= 2048
- pass PupilX2048 { ComputeShader=CS_PupilX2048; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+ pass PupilXLocal { ComputeShader=CS_PupilXLocal; DispatchSizeX=(V2_P+1023)/1024; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 2048
+ pass PupilX2048 { ComputeShader=CS_PupilX2048; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 4096
- pass PupilX4096 { ComputeShader=CS_PupilX4096; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 4096
+ pass PupilX4096 { ComputeShader=CS_PupilX4096; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 8192
- pass PupilX8192 { ComputeShader=CS_PupilX8192; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 8192
+ pass PupilX8192 { ComputeShader=CS_PupilX8192; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 16384
- pass PupilX16384 { ComputeShader=CS_PupilX16384; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 16384
+ pass PupilX16384 { ComputeShader=CS_PupilX16384; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 32768
- pass PupilX32768 { ComputeShader=CS_PupilX32768; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 32768
+ pass PupilX32768 { ComputeShader=CS_PupilX32768; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 65536
- pass PupilX65536 { ComputeShader=CS_PupilX65536; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 65536
+ pass PupilX65536 { ComputeShader=CS_PupilX65536; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 131072
- pass PupilX131072 { ComputeShader=CS_PupilX131072; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 131072
+ pass PupilX131072 { ComputeShader=CS_PupilX131072; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 262144
- pass PupilX262144 { ComputeShader=CS_PupilX262144; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 262144
+ pass PupilX262144 { ComputeShader=CS_PupilX262144; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 524288
- pass PupilX524288 { ComputeShader=CS_PupilX524288; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 524288
+ pass PupilX524288 { ComputeShader=CS_PupilX524288; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 1048576
- pass PupilX1048576 { ComputeShader=CS_PupilX1048576; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 1048576
+ pass PupilX1048576 { ComputeShader=CS_PupilX1048576; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 2097152
- pass PupilX2097152 { ComputeShader=CS_PupilX2097152; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 2097152
+ pass PupilX2097152 { ComputeShader=CS_PupilX2097152; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 4194304
- pass PupilX4194304 { ComputeShader=CS_PupilX4194304; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 4194304
+ pass PupilX4194304 { ComputeShader=CS_PupilX4194304; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 8388608
- pass PupilX8388608 { ComputeShader=CS_PupilX8388608; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 8388608
+ pass PupilX8388608 { ComputeShader=CS_PupilX8388608; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 16777216
- pass PupilX16777216 { ComputeShader=CS_PupilX16777216; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 16777216
+ pass PupilX16777216 { ComputeShader=CS_PupilX16777216; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 33554432
- pass PupilX33554432 { ComputeShader=CS_PupilX33554432; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 33554432
+ pass PupilX33554432 { ComputeShader=CS_PupilX33554432; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 67108864
- pass PupilX67108864 { ComputeShader=CS_PupilX67108864; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 67108864
+ pass PupilX67108864 { ComputeShader=CS_PupilX67108864; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 134217728
- pass PupilX134217728 { ComputeShader=CS_PupilX134217728; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 134217728
+ pass PupilX134217728 { ComputeShader=CS_PupilX134217728; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 268435456
- pass PupilX268435456 { ComputeShader=CS_PupilX268435456; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 268435456
+ pass PupilX268435456 { ComputeShader=CS_PupilX268435456; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 536870912
- pass PupilX536870912 { ComputeShader=CS_PupilX536870912; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 536870912
+ pass PupilX536870912 { ComputeShader=CS_PupilX536870912; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 1073741824
- pass PupilX1073741824 { ComputeShader=CS_PupilX1073741824; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 1073741824
+ pass PupilX1073741824 { ComputeShader=CS_PupilX1073741824; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
- pass PupilRowsCommit { ComputeShader=CS_PupilRowsCommit; DispatchSizeX=(V2_N+15)/16; DispatchSizeY=(V2_N+15)/16; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
- pass PupilYLocal { ComputeShader=CS_PupilYLocal; DispatchSizeX=(V2_N+1023)/1024; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
-#if V2_N >= 2048
- pass PupilY2048 { ComputeShader=CS_PupilY2048; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+ pass PupilRowsCommit { ComputeShader=CS_PupilRowsCommit; DispatchSizeX=(V2_P+15)/16; DispatchSizeY=(V2_P+15)/16; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+ pass PupilYLocal { ComputeShader=CS_PupilYLocal; DispatchSizeX=(V2_P+1023)/1024; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 2048
+ pass PupilY2048 { ComputeShader=CS_PupilY2048; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 4096
- pass PupilY4096 { ComputeShader=CS_PupilY4096; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 4096
+ pass PupilY4096 { ComputeShader=CS_PupilY4096; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 8192
- pass PupilY8192 { ComputeShader=CS_PupilY8192; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 8192
+ pass PupilY8192 { ComputeShader=CS_PupilY8192; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 16384
- pass PupilY16384 { ComputeShader=CS_PupilY16384; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 16384
+ pass PupilY16384 { ComputeShader=CS_PupilY16384; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 32768
- pass PupilY32768 { ComputeShader=CS_PupilY32768; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 32768
+ pass PupilY32768 { ComputeShader=CS_PupilY32768; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 65536
- pass PupilY65536 { ComputeShader=CS_PupilY65536; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 65536
+ pass PupilY65536 { ComputeShader=CS_PupilY65536; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 131072
- pass PupilY131072 { ComputeShader=CS_PupilY131072; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 131072
+ pass PupilY131072 { ComputeShader=CS_PupilY131072; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 262144
- pass PupilY262144 { ComputeShader=CS_PupilY262144; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 262144
+ pass PupilY262144 { ComputeShader=CS_PupilY262144; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 524288
- pass PupilY524288 { ComputeShader=CS_PupilY524288; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 524288
+ pass PupilY524288 { ComputeShader=CS_PupilY524288; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 1048576
- pass PupilY1048576 { ComputeShader=CS_PupilY1048576; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 1048576
+ pass PupilY1048576 { ComputeShader=CS_PupilY1048576; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 2097152
- pass PupilY2097152 { ComputeShader=CS_PupilY2097152; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 2097152
+ pass PupilY2097152 { ComputeShader=CS_PupilY2097152; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 4194304
- pass PupilY4194304 { ComputeShader=CS_PupilY4194304; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 4194304
+ pass PupilY4194304 { ComputeShader=CS_PupilY4194304; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 8388608
- pass PupilY8388608 { ComputeShader=CS_PupilY8388608; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 8388608
+ pass PupilY8388608 { ComputeShader=CS_PupilY8388608; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 16777216
- pass PupilY16777216 { ComputeShader=CS_PupilY16777216; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 16777216
+ pass PupilY16777216 { ComputeShader=CS_PupilY16777216; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 33554432
- pass PupilY33554432 { ComputeShader=CS_PupilY33554432; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 33554432
+ pass PupilY33554432 { ComputeShader=CS_PupilY33554432; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 67108864
- pass PupilY67108864 { ComputeShader=CS_PupilY67108864; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 67108864
+ pass PupilY67108864 { ComputeShader=CS_PupilY67108864; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 134217728
- pass PupilY134217728 { ComputeShader=CS_PupilY134217728; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 134217728
+ pass PupilY134217728 { ComputeShader=CS_PupilY134217728; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 268435456
- pass PupilY268435456 { ComputeShader=CS_PupilY268435456; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 268435456
+ pass PupilY268435456 { ComputeShader=CS_PupilY268435456; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 536870912
- pass PupilY536870912 { ComputeShader=CS_PupilY536870912; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 536870912
+ pass PupilY536870912 { ComputeShader=CS_PupilY536870912; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
-#if V2_N >= 1073741824
- pass PupilY1073741824 { ComputeShader=CS_PupilY1073741824; DispatchSizeX=(V2_N/2+255)/256; DispatchSizeY=V2_N; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+#if V2_P >= 1073741824
+ pass PupilY1073741824 { ComputeShader=CS_PupilY1073741824; DispatchSizeX=(V2_P/2+255)/256; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
 #endif
- pass OpticalIntensity { ComputeShader=CS_OpticalIntensity; DispatchSizeX=(V2_N+7)/8; DispatchSizeY=(V2_N+7)/8; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
+ pass OpticalIntensity { ComputeShader=CS_OpticalIntensity; DispatchSizeX=(V2_P+7)/8; DispatchSizeY=(V2_P+7)/8; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
  pass RawKernel { ComputeShader=CS_RawKernel; DispatchSizeX=(V2_K+7)/8; DispatchSizeY=(V2_K+7)/8; DispatchSizeZ=1; GenerateMipMaps=false; }
  pass KernelStatistics { ComputeShader=CS_KernelStatistics; DispatchSizeX=1; DispatchSizeY=1; DispatchSizeZ=1; GenerateMipMaps=false; }
  pass Extract { ComputeShader=CS_Extract; DispatchSizeX=(V2_W+15)/16; DispatchSizeY=(V2_H+15)/16; DispatchSizeZ=1; GenerateMipMaps=false; }
