@@ -11,12 +11,8 @@ in an ideal world i wouldve learned graphics programming, any way here is some h
   - half res, third res, quarter res or any other integer
 - ability to choose kernel resolution for fine details in the bloom
 - various threshold controls so the whole image isnt convolved
-
-### stuff that maybe will be added
-
-as long as the free trial lasts ill tell the computer to add stuff like:
 - custom aperture texture support
-- cant think of anything else
+
 
 preview images coming when i can be bothered
 
