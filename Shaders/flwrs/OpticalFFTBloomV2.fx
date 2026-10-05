@@ -1,4 +1,4 @@
-// Optical FFT Bloom v2.4 -- standalone shader; no add-on required.
+// Optical FFT Bloom v2.4.1 -- standalone shader; no add-on required.
 // MIT License. See LICENSE.txt. Requires ReShade 6.8+, compute backend.
 // Enter actual dimensions in ReShade's effect preprocessor definitions.
 // Aperture N x N -> centred (N+1) x (N+1) kernel; one texel = one display pixel.
@@ -191,6 +191,23 @@
 #if (V2_FX & (V2_FX-1)) || (V2_FY & (V2_FY-1)) || V2_FX < V2_W+2*V2_BORDER || V2_FY < V2_H+2*V2_BORDER
 #error "FFT dimensions must be powers of two large enough for the frame and full kernel padding. Use zero for automatic sizing."
 #endif
+// ReShade provides presentation metadata, not a guess from pixel brightness.
+#if defined(BUFFER_COLOR_SPACE)
+#define _OFB2_PRESENTATION_SPACE BUFFER_COLOR_SPACE
+#else
+#define _OFB2_PRESENTATION_SPACE 0
+#endif
+#if _OFB2_PRESENTATION_SPACE == 1
+#define _OFB2_INPUT_STATUS "ReShade reports: sRGB SDR."
+#elif _OFB2_PRESENTATION_SPACE == 2
+#define _OFB2_INPUT_STATUS "ReShade reports: linear scRGB."
+#elif _OFB2_PRESENTATION_SPACE == 3
+#define _OFB2_INPUT_STATUS "ReShade reports: HDR10 PQ."
+#elif _OFB2_PRESENTATION_SPACE == 4
+#define _OFB2_INPUT_STATUS "ReShade reports: HLG. Unsupported; Automatic leaves the frame unchanged."
+#else
+#define _OFB2_INPUT_STATUS "ReShade reports: unknown. Automatic assumes sRGB SDR; use a manual override if needed."
+#endif
 static const float PI=3.141592653589793;
 uniform float BloomIntensity < ui_category="Bloom"; ui_label="Bloom intensity"; ui_category_closed=false; ui_tooltip="Overall brightness of the glow added to the scene. Higher values make bloom stronger; 0 hides it."; ui_type="slider"; ui_min=0; ui_max=4;  > = 0.15;
 uniform float Threshold < ui_category="Bloom"; ui_label="Threshold"; ui_tooltip="Minimum source brightness for bloom, measured in linear light after Highlight selection exposure and the highlight shoulder. Raise it to limit bloom to brighter lights."; ui_type="slider"; ui_min=0; ui_max=2;  > = 0.6;
@@ -277,8 +294,8 @@ uniform float WingLift < ui_category="Diffraction"; ui_label="Wing lift"; ui_too
 uniform float SpectralDispersion < ui_category="Chromatic optics"; ui_label="Spectral dispersion"; ui_category_closed=true; ui_tooltip="Amount of wavelength-dependent spreading. 0 keeps the colours at the same diffraction scale; higher values separate them more and strengthen coloured fringes."; ui_type="slider"; ui_min=0; ui_max=4;  > = 1;
 uniform float ChromaticFocus < ui_category="Chromatic optics"; ui_label="Chromatic focal shift"; ui_tooltip="Makes different colours focus differently. 0 adds no colour-dependent focus shift; larger positive or negative values strengthen it."; ui_type="slider"; ui_min=-4; ui_max=4;  > = 0;
 uniform float FringeSuppression < ui_category="Chromatic optics"; ui_label="Chromatic fringe suppression"; ui_tooltip="Removes colour from the optical pattern. 0 keeps its spectral colours; 1 makes the kernel greyscale. The colour of the source lights still passes into the bloom."; ui_type="slider"; ui_min=0; ui_max=1;  > = 0;
-uniform int InputSpace < ui_category="Colour space"; ui_label="Input colour space"; ui_category_closed=true; ui_tooltip="Match the colour encoding of the game frame: sRGB SDR for normal SDR, Linear / scRGB for linear values, or HDR10 PQ for PQ-encoded HDR. Bloom is calculated in linear light after decoding."; ui_type="combo"; ui_items="sRGB SDR\0Linear / scRGB\0HDR10 PQ\0";  > = 0;
-uniform float ReferenceWhite < ui_category="Colour space"; ui_label="Reference white (nits)"; ui_tooltip="For HDR10 PQ, the brightness in nits represented by a linear value of 1. Increasing it makes the same HDR light smaller relative to Threshold. Ignored for sRGB and Linear / scRGB."; ui_type="slider"; ui_min=80; ui_max=1000;  > = 203;
+uniform int InputSpace < ui_category="Colour space"; ui_label="Input colour space"; ui_category_closed=true; ui_tooltip="Automatic uses the presentation colour space reported by ReShade: sRGB SDR, linear scRGB, or HDR10 PQ. Unknown assumes sRGB; HLG is unsupported and Automatic leaves the frame unchanged. Automatic selects the existing decoder; manual modes retain their previous values and scaling. Override when an earlier effect changes the encoding. Selecting PQ on an SDR frame artificially brightens bloom; it does not recover HDR highlights."; ui_type="combo"; ui_items="sRGB SDR\0Linear / scRGB\0HDR10 PQ\0Automatic\0"; ui_text=_OFB2_INPUT_STATUS; > = 3;
+uniform float ReferenceWhite < ui_category="Colour space"; ui_label="Reference white (nits)"; ui_tooltip="For HDR10 PQ, the brightness in nits represented by a linear value of 1. Increasing it makes the same HDR light smaller relative to Threshold. Also used when Automatic detects PQ; ignored for sRGB and Linear / scRGB."; ui_type="slider"; ui_min=80; ui_max=1000;  > = 203;
 uniform bool OutputClamp < ui_category="Colour space"; ui_label="Clamp SDR output"; ui_tooltip="Limits the final sRGB SDR output to the 0-1 range. Automatically ignored for Linear / scRGB and HDR10 PQ.";  > = true;
 uniform float PreviewExposure < ui_category="Preview"; ui_label="Kernel preview exposure"; ui_category_closed=true; ui_tooltip="Brightness of the kernel preview only, in stops. +1 doubles it and -1 halves it. Does not change the generated kernel or bloom."; ui_type="slider"; ui_min=-12; ui_max=20;  > = 7;
 uniform bool PreviewLog < ui_category="Preview"; ui_label="Log kernel preview"; ui_tooltip="Uses a logarithmic brightness display to reveal faint spikes and tails in the kernel preview. Preview only; does not change bloom.";  > = true;
@@ -1229,19 +1246,39 @@ float2 EmbeddedRead(int2 pos,uint channel){
  return float2(value[channel],0);
 }
 
+// Manual enum values 0/1/2 stay unchanged for existing ReShade presets.
+int EffectiveInputSpace(){
+ if(InputSpace!=3)return InputSpace;
+#if _OFB2_PRESENTATION_SPACE == 2
+ return 1;
+#elif _OFB2_PRESENTATION_SPACE == 3
+ return 2;
+#else
+ return 0;
+#endif
+}
+bool AutoInputUnsupported(){
+#if _OFB2_PRESENTATION_SPACE == 4
+ return InputSpace==3;
+#else
+ return false;
+#endif
+}
 float3 Decode(float3 v){
- if(InputSpace!=1)v=max(v,0);
- if(InputSpace==0)v=lerp(v/12.92,pow(max((v+0.055)/1.055,0),2.4),step(0.04045,v));
- else if(InputSpace==2){
+ int inputSpace=EffectiveInputSpace();
+ if(inputSpace!=1)v=max(v,0);
+ if(inputSpace==0)v=lerp(v/12.92,pow(max((v+0.055)/1.055,0),2.4),step(0.04045,v));
+ else if(inputSpace==2){
   float3 p=pow(max(v,0),1.0/78.84375);
   v=10000*pow(max(p-0.8359375,0)/max(18.8515625-18.6875*p,0.00000001),1.0/0.1593017578125)/max(ReferenceWhite,0.01);
  }
  return v;
 }
 float3 Encode(float3 v){
- if(InputSpace!=1)v=max(v,0);
- if(InputSpace==0)v=lerp(v*12.92,1.055*pow(max(v,0),1.0/2.4)-0.055,step(0.0031308,v));
- else if(InputSpace==2){
+ int inputSpace=EffectiveInputSpace();
+ if(inputSpace!=1)v=max(v,0);
+ if(inputSpace==0)v=lerp(v*12.92,1.055*pow(max(v,0),1.0/2.4)-0.055,step(0.0031308,v));
+ else if(inputSpace==2){
   float3 p=pow(max(v*max(ReferenceWhite,0.01)/10000,0),0.1593017578125);
   v=pow((0.8359375+18.8515625*p)/(1+18.6875*p),78.84375);
  }
@@ -1268,6 +1305,7 @@ float3 ExtractLight(float3 v){
  return result;
 }
 float3 SourceAt(int2 display){
+ if(AutoInputUnsupported())return 0;
  float2 uv=(clamp(display,int2(0,0),int2(BUFFER_WIDTH-1,BUFFER_HEIGHT-1))+0.5)/float2(BUFFER_WIDTH,BUFFER_HEIGHT);
  float3 v=Decode(tex2Dlod(GameS,float4(uv,0,0)).rgb);
  if(AntiFirefly>0){
@@ -2768,6 +2806,7 @@ float3 OpticsPreview(float2 pixel){
  return value;
 }
 float4 PS_Composite(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target{
+ if(AutoInputUnsupported())return tex2Dlod(GameS,float4(uv,0,0));
  float3 scene=Decode(tex2Dlod(GameS,float4(uv,0,0)).rgb);
  // Uniform display-pixel spacing even when the display dimensions are not
  // divisible by DIV: scene texel i is centred at (i+0.5)*DIV pixels.
@@ -2781,11 +2820,11 @@ float4 PS_Composite(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target{
  else if(BlendMode==1)result=scene+(1-saturate(scene))*saturate(bloom);
  else if(BlendMode==2)result=max(scene-source*min(BloomIntensity,1),0)+bloom;
  else result=scene+bloom;
- if(OutputClamp&&InputSpace==0)result=saturate(result);
+ if(OutputClamp&&EffectiveInputSpace()==0)result=saturate(result);
  return float4(Encode(result),1);
 }
 
-technique OpticalFFTBloomV2 < ui_label="Optical FFT Bloom v2.4"; ui_tooltip="Procedural or custom-PNG optics, optional calibrated Fresnel propagation. Edit resolution, PSF oversampling and PNG loading in effect preprocessor definitions; no shader-imposed resolution ceiling."; > {
+technique OpticalFFTBloomV2 < ui_label="Optical FFT Bloom v2.4.1"; ui_tooltip="Procedural or custom-PNG optics, optional calibrated Fresnel propagation. Edit resolution, PSF oversampling and PNG loading in effect preprocessor definitions; no shader-imposed resolution ceiling."; > {
  pass CacheState { ComputeShader=CS_CacheState; DispatchSizeX=1; DispatchSizeY=1; DispatchSizeZ=1; GenerateMipMaps=false; }
  pass Aperture { ComputeShader=CS_Aperture; DispatchSizeX=(V2_N+7)/8; DispatchSizeY=(V2_N+7)/8; DispatchSizeZ=1; GenerateMipMaps=false; }
  pass PupilXLocal { ComputeShader=CS_PupilXLocal; DispatchSizeX=(V2_P+1023)/1024; DispatchSizeY=V2_P; DispatchSizeZ=V2_WAVES; GenerateMipMaps=false; }
