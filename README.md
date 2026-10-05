@@ -13,7 +13,6 @@ in an ideal world i wouldve learned graphics programming, any way here is some h
 - various threshold controls so the whole image isnt convolved
 - custom aperture texture support
 
-
-preview images coming when i can be bothered
+![Aperture and Kernel showcase + Forza Horizon 6 demo photo](https://files.catbox.moe/dc3fu2.png)
 
 #### support human creation, free palestine
